@@ -6,14 +6,18 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from io import BytesIO, StringIO
+from functools import wraps
+from io import BytesIO
 from pathlib import Path
 from typing import (IO, Any, BinaryIO, Callable, Dict, Iterator, List,
-                    Optional, Set, Tuple, Union)
+                    Optional, Tuple, Union)
+
+import psutil
 
 from cattrs import Converter
 
@@ -21,30 +25,44 @@ from lsprotocol import converters
 from lsprotocol.types import (ClientCapabilities,
                               ClientRegisterCapabilityRequest,
                               ClientRegisterCapabilityResponse,
-                              CreateFilesParams, DeleteFilesParams,
+                              CompletionParams, CreateFilesParams,
+                              DeleteFilesParams,
                               DidChangeConfigurationClientCapabilities,
                               DidChangeConfigurationParams,
                               DidChangeTextDocumentParams,
                               DidCloseTextDocumentParams,
                               DidOpenTextDocumentParams,
-                              DidSaveTextDocumentParams, ExitNotification,
+                              DidSaveTextDocumentParams,
+                              DocumentFormattingParams,
+                              DocumentHighlightParams,
+                              DocumentRangeFormattingParams,
+                              DocumentSymbolParams, ExitNotification,
                               FileCreate, FileDelete,
                               FileOperationClientCapabilities, FileRename,
+                              FormattingOptions, HoverParams,
                               InitializedNotification, InitializedParams,
                               InitializeParams, InitializeRequest,
                               InitializeResponse,
                               InitializeResultServerInfoType, Position, Range,
                               Registration, RenameFilesParams, SaveOptions,
-                              ServerCapabilities, ShutdownRequest,
+                              SemanticTokensParams, ServerCapabilities,
+                              ShutdownRequest, TelemetryEventNotification,
                               TextDocumentClientCapabilities,
+                              TextDocumentCompletionRequest,
                               TextDocumentContentChangeEvent_Type1,
                               TextDocumentContentChangeEvent_Type2,
                               TextDocumentDidChangeNotification,
                               TextDocumentDidCloseNotification,
                               TextDocumentDidOpenNotification,
                               TextDocumentDidSaveNotification,
-                              TextDocumentIdentifier, TextDocumentItem,
+                              TextDocumentDocumentHighlightRequest,
+                              TextDocumentDocumentSymbolRequest,
+                              TextDocumentFormattingRequest,
+                              TextDocumentHoverRequest, TextDocumentIdentifier,
+                              TextDocumentItem,
+                              TextDocumentRangeFormattingRequest,
                               TextDocumentSaveReason,
+                              TextDocumentSemanticTokensFullRequest,
                               TextDocumentSyncClientCapabilities,
                               TextDocumentSyncKind, TextDocumentSyncOptions,
                               TextDocumentWillSaveNotification,
@@ -67,6 +85,18 @@ from llanguage_test_client.json_rpc import JsonObject, JsonValue
 from llanguage_test_client.lsp_client import FileRenameMapping, LspClient, Uri
 from llanguage_test_client.lsp_json_stream import LspJsonStream
 from llanguage_test_client.lsp_text_document import LspTextDocument
+
+
+def requires_server_capabilities(fn: Callable) -> Callable:
+    @wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        # NOTE: If an error occurred during the server's initialization, the
+        # `server_capabilities` attribute may never have been set.
+        if hasattr(self, 'server_capabilities'):
+            return fn(self, *args, **kwargs)
+        return False
+    return wrapper
+
 
 # NOTE: File URIs follow one of the following schemes:
 # 1. `file:/path` (no hostname)
@@ -181,6 +211,7 @@ class LspTestClient(LspClient):
     timeout_s: float
 
     server: ServerProcess
+    process: psutil.Process
     message_stream: LspJsonStream
     ostream: IO[bytes]
     buf: BytesIO
@@ -199,7 +230,7 @@ class LspTestClient(LspClient):
     responses_by_id: Dict[JsonValue, Any]
     callbacks_by_id: Dict[JsonValue, Tuple[Any, Callback]]
     stop: threading.Event
-    # stderr_printer: threading.Thread
+    stderr_printer: threading.Thread
     client_log_path: str
     stdout_log_path: str
     stdin_log_path: str
@@ -233,37 +264,48 @@ class LspTestClient(LspClient):
         self.responses_by_id = dict()
         self.callbacks_by_id = dict()
         self.stop = threading.Event()
-        # self.stderr_printer = threading.Thread(
-        #     target=self.print_stderr,
-        #     args=tuple()
-        # )
+        self.stderr_printer = threading.Thread(
+            target=self.print_stderr,
+            args=tuple()
+        )
         self.client_log_path = client_log_path
         self.stdout_log_path = stdout_log_path
         self.stdin_log_path = stdin_log_path
 
     def print_stderr(self) -> None:
-        if self.server.stderr is not None:
-            buf = StringIO()
-            while self.check_server() and not self.stop.is_set():
-                try:
-                    bs = self.server.stderr.read(1)
-                    if bs is not None:
-                        buf.seek(0)
-                        buf.truncate(0)
-                        while (bs is not None) and (len(bs) > 0) and not self.stop.is_set():
-                            buf.write(bs.decode("utf-8"))
-                            bs = self.server.stderr.read(1)
-                        print(buf.getvalue(), file=sys.stderr)
-                        continue
-                except BlockingIOError:
-                    pass
-                time.sleep(0.100)
-
-    def has_event(self, pred: EventPredFn) -> bool:
-        for event in self.events:
-            if pred(event):
-                return True
-        return False
+        buf = BytesIO()
+        try:
+            if self.server.stderr is not None:
+                while self.check_server():
+                    try:
+                        bs = self.server.stderr.read(4096)
+                        if bs is not None:
+                            buf.seek(0)
+                            buf.truncate(0)
+                            while (bs is not None) and (len(bs) > 0):
+                                buf.write(bs)
+                                bs = self.server.stderr.read(4096)
+                            print(buf.getvalue().decode('utf-8'), end='', file=sys.stderr)
+                            continue
+                    except BlockingIOError:
+                        pass
+                    time.sleep(0.100)
+        except BaseException as e:
+            print(
+                "Caught unhandled exception while printing stderr logs from the server:", e,
+                file=sys.stderr
+            )
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            # Print whatever is left in the buffer
+            buf.seek(0)
+            buf.truncate(0)
+            if self.server.stderr is not None:
+                bs = self.server.stderr.read(4096)
+                while (bs is not None) and (len(bs) > 0):
+                    buf.write(bs)
+                    bs = self.server.stderr.read(4096)
+            print(buf.getvalue().decode('utf-8'), file=sys.stderr)
 
     def find_incoming_event(self, pred: IncomingEventPredFn, lower_index: int = 0) \
             -> Tuple[Optional[IncomingEvent], int]:
@@ -316,6 +358,7 @@ class LspTestClient(LspClient):
     ) -> LspTextDocument:
         document_id = self.next_document_id()
         document = LspTextDocument(self, document_id, language_id, path)
+        document.on_change(self.update_document_symbols)
         self.documents_by_id[document_id] = document
         if path is not None:
             self.documents_by_uri[document.uri] = document
@@ -330,22 +373,6 @@ class LspTestClient(LspClient):
             return document
         path = RE_FILE_URI.sub(uri, "")
         return self.open_document(language_id, path)
-
-    def await_validation(self, uri: str, version: int) -> Any:
-        def is_validation(message: Any) -> bool:
-            if message.get("method", None) == "textDocument/publishDiagnostics":
-                params = message["params"]
-                return params["uri"] == uri \
-                    and params.get("version", None) == version
-            return False
-        event, _ = self.find_incoming_event(lambda event: is_validation(event.data))
-        if event is not None:
-            return event.data
-        while not self.stop.is_set():
-            message = self.receive_message()
-            if is_validation(message):
-                return message
-        return None
 
     def await_response(
             self,
@@ -404,31 +431,33 @@ class LspTestClient(LspClient):
             [self.server_path] + self.server_params,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            # stderr=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=0,
-            # bufsize=1,
         )
+
         if self.server.stdout is None:
             raise RuntimeError("Cannot read from server stdout")
         if self.server.stdin is None:
             raise RuntimeError("Cannot write to server stdin")
-        # if self.server.stderr is None:
-        #     raise RuntimeError("Cannot read from server stderr")
+        if self.server.stderr is None:
+            raise RuntimeError("Cannot read from server stderr")
 
         # Make process stdout non-blocking
         stdout_fd = self.server.stdout.fileno()
         os.set_blocking(stdout_fd, False)
-        # stderr_fd = self.server.stderr.fileno()
-        # os.set_blocking(stderr_fd, False)
+        stderr_fd = self.server.stderr.fileno()
+        os.set_blocking(stderr_fd, False)
+
+        self.process = psutil.Process(self.server.pid)
 
         self.message_stream = LspJsonStream(
             SpyIO(self.server.stdout, self.stdout_log),
-            self.timeout_s
+            self.timeout_s,
+            self.check_server
         )
         self.ostream = SpyIO(self.server.stdin, self.stdin_log)
 
-        # self.stderr_printer.start()
+        self.stderr_printer.start()
 
         initialize_id = self.send_initialize(self.initialize_params())
         self.await_response(initialize_id)
@@ -442,22 +471,61 @@ class LspTestClient(LspClient):
         self.send_exit()
 
         self.stop.set()
-        # self.stderr_printer.join()
+        self.stderr_printer.join()
 
         try:
-            self.server.wait(timeout=self.timeout_s)
+            if self.timeout_s > 0.0:
+                self.server.wait(timeout=self.timeout_s)
+            else:
+                self.server.wait()
         except subprocess.TimeoutExpired as e:
-            os.kill(self.server.pid, signal.SIGKILL)
+            self.kill_server()
             raise RuntimeError(
                 f"Timed-out after {self.timeout_s} seconds while awaiting the server to terminate."
             ) from e
 
-    def check_server(self) -> bool:
-        if self.server.poll():
-            raise RuntimeError(
-                f"ServerProcess crashed with status: {self.server.returncode}"
+    def kill_server(self) -> None:
+        self.stop.set()
+        if self.server.poll() is None:
+            print(
+                'Server did not terminate cleanly, terminating it forcefully ...',
+                file=sys.stderr
             )
-        return True
+            try:
+                os.kill(self.server.pid, signal.SIGINT)
+                self.server.wait(timeout=1.0)
+            except ProcessLookupError:
+                pass
+            finally:
+                if self.server.poll() is None:
+                    try:
+                        os.kill(self.server.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def check_server(self) -> bool:
+        try:
+            if self.process.is_running():
+                if self.process.status() == psutil.STATUS_ZOMBIE:
+                    self.kill_server()
+                    print(
+                        "ServerProcess has become defunct and will no longer respond",
+                        file=sys.stderr
+                    )
+                else:
+                    # The server is running as expected; there's nothing to do
+                    pass
+            else:
+                self.stop.set()
+                print(
+                    f"ServerProcess crashed with status: {self.server.returncode}",
+                    file=sys.stderr
+                )
+        except BaseException as e:
+            self.stop.set()
+            raise e
+        finally:
+            return not self.stop.is_set()
 
     def send_message(self, message: Any) -> None:
         self.events.append(OutgoingEvent(message))
@@ -471,41 +539,44 @@ class LspTestClient(LspClient):
         self.buf.write(f"Content-Length: {len(body)}\r\n".encode("utf-8"))
         self.buf.write(b"\r\n")
         self.buf.write(body)
-        self.check_server()
         print(
             f"[{timestamp()}] Sending:\n{self.buf.getvalue().decode('utf-8')}",
             file=self.log_file
         )
         self.log_file.flush()
-        self.ostream.write(self.buf.getvalue())
-        self.ostream.flush()
+        if self.check_server():
+            self.ostream.write(self.buf.getvalue())
+            self.ostream.flush()
 
     def send_request(
             self,
             request_id: int,
             request: Any,
             callback: Callback
-    ) -> None:
+    ) -> int:
         self.requests_by_id[request_id] = request
         self.callbacks_by_id[request_id] = (request, callback)
         self.send_message(request)
+        return request_id
 
     def receive_message(self) -> JsonObject:
-        self.check_server()
-        message = self.message_stream.next()
-        print(
-            f"[{timestamp()}] Receiving:\n{self.message_stream.message()}",
-            file=self.log_file
-        )
-        match message:
-            case dict():
-                self.events.append(IncomingEvent(message))
-                self.dispatch_message(message)
-                return message
-            case _:
-                raise RuntimeError(
-                    f"Unsupported message type ({type(message)}): {message}"
-                )
+        if self.check_server():
+            message = self.message_stream.next()
+            print(
+                f"[{timestamp()}] Receiving:\n{self.message_stream.message()}",
+                file=self.log_file
+            )
+            match message:
+                case dict():
+                    self.events.append(IncomingEvent(message))
+                    self.dispatch_message(message)
+                    return message
+                case _:
+                    raise RuntimeError(
+                        f"Unsupported message type ({type(message)}): {message}"
+                    )
+        else:
+            raise RuntimeError("Server has terminated.")
 
     def dispatch_message(self, message: JsonObject) -> None:
         if 'method' in message:
@@ -534,6 +605,12 @@ class LspTestClient(LspClient):
                 )
                 response = self.receive_workspace_configuration(request)
                 self.send_message(response)
+            case "telemetry/event":
+                notification = self.converter.structure(
+                    message,
+                    TelemetryEventNotification
+                )
+                self.receive_telemetry_event(notification)
 
     def respond_to_notification(self) -> None:
         self.send_message({"id": None, "result": None, "jsonrpc": "2.0"})
@@ -559,11 +636,14 @@ class LspTestClient(LspClient):
     def serialize_json(self, message: Any) -> str:
         return json.dumps(message, default=self.converter.unstructure)
 
+    def receive_telemetry_event(self, notification: TelemetryEventNotification) -> None:
+        # Check the event in the logs
+        pass
+
     def send_initialize(self, params: InitializeParams) -> int:
         request_id = self.next_request_id()
         request = InitializeRequest(request_id, params)
-        self.send_request(request_id, request, self.receive_initialize)
-        return request_id
+        return self.send_request(request_id, request, self.receive_initialize)
 
     def receive_initialize(self, request: Any, message: JsonObject) -> None:
         response = self.converter.structure(
@@ -581,8 +661,7 @@ class LspTestClient(LspClient):
     def send_shutdown(self) -> int:
         request_id = self.next_request_id()
         request = ShutdownRequest(request_id)
-        self.send_request(request_id, request, self.receive_shutdown)
-        return request_id
+        return self.send_request(request_id, request, self.receive_shutdown)
 
     def receive_shutdown(self, request: Any, message: JsonObject) -> None:
         # response = self.converter.structure(
@@ -633,6 +712,7 @@ class LspTestClient(LspClient):
         response = WorkspaceConfigurationResponse(request.id, configs)
         return response
 
+    @requires_server_capabilities
     def server_supports_text_document_did_open_or_close(self) -> bool:
         text_document_sync = self.server_capabilities.text_document_sync
         if isinstance(text_document_sync, TextDocumentSyncOptions):
@@ -703,6 +783,7 @@ class LspTestClient(LspClient):
         notification = TextDocumentWillSaveNotification(params)
         self.send_message(notification)
 
+    @requires_server_capabilities
     def server_supports_text_document_will_save(self) -> bool:
         text_document_sync = self.server_capabilities.text_document_sync
         if isinstance(text_document_sync, TextDocumentSyncOptions):
@@ -729,9 +810,11 @@ class LspTestClient(LspClient):
     ) -> int:
         request_id = self.next_request_id()
         request = TextDocumentWillSaveWaitUntilRequest(request_id, params)
-        self.send_request(request_id, request,
-                          self.receive_text_document_will_save_wait_until)
-        return request_id
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_text_document_will_save_wait_until
+        )
 
     def receive_text_document_will_save_wait_until(
             self,
@@ -747,6 +830,7 @@ class LspTestClient(LspClient):
             document = self.documents_by_uri[uri]
             document.apply(response.result)
 
+    @requires_server_capabilities
     def server_supports_text_document_will_save_wait_until(self) -> bool:
         text_document_sync = self.server_capabilities.text_document_sync
         if isinstance(text_document_sync, TextDocumentSyncOptions):
@@ -775,6 +859,7 @@ class LspTestClient(LspClient):
         notification = TextDocumentDidSaveNotification(params)
         self.send_message(notification)
 
+    @requires_server_capabilities
     def server_supports_full_text_on_save(self) -> bool:
         text_document_sync = self.server_capabilities.text_document_sync
         if isinstance(text_document_sync, TextDocumentSyncOptions):
@@ -783,6 +868,7 @@ class LspTestClient(LspClient):
                 return bool(save.include_text)
         return False
 
+    @requires_server_capabilities
     def server_supports_did_save(self) -> bool:
         text_document_sync = self.server_capabilities.text_document_sync
         if isinstance(text_document_sync, TextDocumentSyncOptions):
@@ -806,6 +892,7 @@ class LspTestClient(LspClient):
         notification = TextDocumentDidChangeNotification(params)
         self.send_message(notification)
 
+    @requires_server_capabilities
     def server_supports_text_document_sync_kind(
             self,
             kind: TextDocumentSyncKind
@@ -820,6 +907,7 @@ class LspTestClient(LspClient):
                         return kind == text_document_sync.change
         return kind == TextDocumentSyncKind.Full
 
+    @requires_server_capabilities
     def server_supports_text_document_did_change(self) -> bool:
         text_document_sync = self.server_capabilities.text_document_sync
         if isinstance(text_document_sync, TextDocumentSyncOptions):
@@ -863,15 +951,12 @@ class LspTestClient(LspClient):
                     ) \
                     else TextDocumentContentChangeEvent_Type2(
                         text=full_text
-                    ) \
-                    if self.server_supports_text_document_sync_kind(
-                        TextDocumentSyncKind.Full
-                    ) \
-                    else None
+                    )
                 ]
             )
             self.send_text_document_did_change(params)
 
+    @requires_server_capabilities
     def server_supports_workspace_will_create_files(self) -> bool:
         workspace = self.server_capabilities.workspace
         if workspace is not None:
@@ -884,9 +969,11 @@ class LspTestClient(LspClient):
     def send_workspace_will_create_files(self, params: CreateFilesParams) -> int:
         request_id = self.next_request_id()
         request = WorkspaceWillCreateFilesRequest(request_id, params)
-        self.send_request(request_id, request,
-                          self.receive_workspace_will_create_files)
-        return request_id
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_workspace_will_create_files
+        )
 
     def receive_workspace_will_create_files(
             self,
@@ -904,6 +991,7 @@ class LspTestClient(LspClient):
             request_id = self.send_workspace_will_create_files(params)
             self.await_response(request_id)
 
+    @requires_server_capabilities
     def server_supports_workspace_did_create_files(self) -> bool:
         workspace = self.server_capabilities.workspace
         if workspace is not None:
@@ -927,6 +1015,7 @@ class LspTestClient(LspClient):
             )
             self.send_workspace_did_create_files(params)
 
+    @requires_server_capabilities
     def server_supports_workspace_will_rename_files(self) -> bool:
         workspace = self.server_capabilities.workspace
         if workspace is not None:
@@ -939,9 +1028,11 @@ class LspTestClient(LspClient):
     def send_workspace_will_rename_files(self, params: RenameFilesParams) -> int:
         request_id = self.next_request_id()
         request = WorkspaceWillRenameFilesRequest(request_id, params)
-        self.send_request(request_id, request,
-                          self.receive_workspace_will_rename_files)
-        return request_id
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_workspace_will_rename_files
+        )
 
     def receive_workspace_will_rename_files(
             self,
@@ -959,6 +1050,7 @@ class LspTestClient(LspClient):
             request_id = self.send_workspace_will_rename_files(params)
             self.await_response(request_id)
 
+    @requires_server_capabilities
     def server_supports_workspace_did_rename_files(self) -> bool:
         workspace = self.server_capabilities.workspace
         if workspace is not None:
@@ -983,6 +1075,7 @@ class LspTestClient(LspClient):
             )
             self.send_workspace_did_rename_files(params)
 
+    @requires_server_capabilities
     def server_supports_workspace_will_delete_files(self) -> bool:
         workspace = self.server_capabilities.workspace
         if workspace is not None:
@@ -995,9 +1088,11 @@ class LspTestClient(LspClient):
     def send_workspace_will_delete_files(self, params: DeleteFilesParams) -> int:
         request_id = self.next_request_id()
         request = WorkspaceWillDeleteFilesRequest(request_id, params)
-        self.send_request(request_id, request,
-                          self.receive_workspace_will_delete_files)
-        return request_id
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_workspace_will_delete_files
+        )
 
     def receive_workspace_will_delete_files(
             self,
@@ -1015,6 +1110,7 @@ class LspTestClient(LspClient):
             request_id = self.send_workspace_will_delete_files(params)
             self.await_response(request_id)
 
+    @requires_server_capabilities
     def server_supports_workspace_did_delete_files(self) -> bool:
         workspace = self.server_capabilities.workspace
         if workspace is not None:
@@ -1037,3 +1133,276 @@ class LspTestClient(LspClient):
                 files=[FileDelete(uri) for uri in files]
             )
             self.send_workspace_did_delete_files(params)
+
+    @requires_server_capabilities
+    def server_supports_document_highlight(self) -> bool:
+        return self.server_capabilities.document_highlight_provider is not None
+
+    def send_text_document_document_highlight(
+            self,
+            params: DocumentHighlightParams
+    ) -> int:
+        request_id = self.next_request_id()
+        request = TextDocumentDocumentHighlightRequest(request_id, params)
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_text_document_document_highlight
+        )
+
+    def receive_text_document_document_highlight(
+            self,
+            request: Any,
+            message: JsonObject
+    ) -> None:
+        # NOTE: Implement this in the concrete subclass because it may require
+        # language-specific information (such as the language identifier for the
+        # associated text document).
+        raise NotImplementedError
+
+    def highlight_symbol(self, uri: str, line: int, column: int) -> None:
+        if self.server_supports_document_highlight():
+            params = DocumentHighlightParams(
+                text_document=TextDocumentIdentifier(
+                    uri=uri,
+                ),
+                position=Position(
+                    line=line,
+                    character=column,
+                ),
+            )
+            request_id = self.send_text_document_document_highlight(params)
+            self.await_response(request_id)
+
+    @requires_server_capabilities
+    def server_supports_document_hover(self) -> bool:
+        return self.server_capabilities.hover_provider is not None
+
+    def send_text_document_hover(
+            self,
+            params: HoverParams
+    ) -> int:
+        request_id = self.next_request_id()
+        request = TextDocumentHoverRequest(request_id, params)
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_text_document_hover
+        )
+
+    def receive_text_document_hover(
+            self,
+            request: Any,
+            message: JsonObject
+    ) -> None:
+        # NOTE: Implement this in the concrete subclass because it may require
+        # language-specific information (such as the language identifier for the
+        # associated text document).
+        raise NotImplementedError
+
+    def hover(self, uri: str, line: int, column: int) -> None:
+        if self.server_supports_document_hover():
+            params = HoverParams(
+                text_document=TextDocumentIdentifier(
+                    uri=uri,
+                ),
+                position=Position(
+                    line=line,
+                    character=column,
+                ),
+            )
+            request_id = self.send_text_document_hover(params)
+            self.await_response(request_id)
+
+    @requires_server_capabilities
+    def server_supports_document_symbols(self) -> bool:
+        return self.server_capabilities.document_symbol_provider is not None
+
+    def send_text_document_document_symbol(
+            self,
+            params: DocumentSymbolParams
+    ) -> int:
+        request_id = self.next_request_id()
+        request = TextDocumentDocumentSymbolRequest(request_id, params)
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_text_document_document_symbol
+        )
+
+    def receive_text_document_document_symbol(
+            self,
+            request: Any,
+            message: JsonObject
+    ) -> None:
+        # NOTE: Implement this in the concrete subclass because it may require
+        # language-specific information (such as the language identifier for the
+        # associated text document).
+        raise NotImplementedError
+
+    def update_document_symbols(self, document_id: int, uri: Optional[str]) -> None:
+        if (uri is not None) and self.server_supports_document_symbols():
+            params = DocumentSymbolParams(
+                text_document=TextDocumentIdentifier(
+                    uri=uri
+                )
+            )
+            request_id = self.send_text_document_document_symbol(params)
+            self.await_response(request_id)
+
+    @requires_server_capabilities
+    def server_supports_semantic_highlight(self) -> bool:
+        return self.server_capabilities.semantic_tokens_provider is not None
+
+    def send_text_document_semantic_tokens_full(
+            self,
+            params: SemanticTokensParams
+    ) -> int:
+        request_id = self.next_request_id()
+        request = TextDocumentSemanticTokensFullRequest(request_id, params)
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_text_document_semantic_tokens_full
+        )
+
+    def receive_text_document_semantic_tokens_full(
+            self,
+            request: Any,
+            message: JsonObject
+    ) -> None:
+        # NOTE: Implement this in the concrete subclass because it may require
+        # language-specific information (such as the language identifier for the
+        # associated text document).
+        raise NotImplementedError
+
+    def semantic_highlight(self, uri: str) -> None:
+        if self.server_supports_document_highlight():
+            params = SemanticTokensParams(
+                text_document=TextDocumentIdentifier(
+                    uri=uri,
+                ),
+            )
+            request_id = self.send_text_document_semantic_tokens_full(params)
+            self.await_response(request_id)
+
+    @requires_server_capabilities
+    def server_supports_code_completion(self) -> bool:
+        return self.server_capabilities.completion_provider is not None
+
+    def send_text_document_completion(
+            self,
+            params: CompletionParams
+    ) -> int:
+        request_id = self.next_request_id()
+        request = TextDocumentCompletionRequest(request_id, params)
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_text_document_completion
+        )
+
+    def receive_text_document_completion(
+            self,
+            request: Any,
+            message: JsonObject
+    ) -> None:
+        # NOTE: Implement this in the concrete subclass because it may require
+        # language-specific information (such as the language identifier for the
+        # associated text document).
+        raise NotImplementedError
+
+    def complete(self, uri: str, line: int, column: int) -> None:
+        if self.server_supports_document_highlight():
+            params = CompletionParams(
+                text_document=TextDocumentIdentifier(
+                    uri=uri,
+                ),
+                position=Position(
+                    line=line,
+                    character=column,
+                ),
+            )
+            request_id = self.send_text_document_completion(params)
+            self.await_response(request_id)
+
+    @requires_server_capabilities
+    def server_supports_formatting(self) -> bool:
+        return self.server_capabilities.document_formatting_provider is not None
+
+    def send_text_document_formatting(
+            self,
+            params: DocumentFormattingParams
+    ) -> int:
+        request_id = self.next_request_id()
+        request = TextDocumentFormattingRequest(request_id, params)
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_text_document_formatting
+        )
+
+    def receive_text_document_formatting(
+            self,
+            request: Any,
+            message: JsonObject
+    ) -> None:
+        # NOTE: Implement this in the concrete subclass because it may require
+        # language-specific information (such as the language identifier for the
+        # associated text document).
+        raise NotImplementedError
+
+    def format(self, uri: str) -> None:
+        if self.server_supports_formatting():
+            params = DocumentFormattingParams(
+                text_document=TextDocumentIdentifier(
+                    uri=uri,
+                ),
+                options=FormattingOptions(
+                    tab_size=4,
+                    insert_spaces=True,
+                ),
+            )
+            request_id = self.send_text_document_formatting(params)
+            self.await_response(request_id)
+
+    @requires_server_capabilities
+    def server_supports_range_formatting(self) -> bool:
+        return self.server_capabilities.document_range_formatting_provider is not None
+
+    def send_text_document_range_formatting(
+            self,
+            params: DocumentRangeFormattingParams
+    ) -> int:
+        request_id = self.next_request_id()
+        request = TextDocumentRangeFormattingRequest(request_id, params)
+        return self.send_request(
+            request_id,
+            request,
+            self.receive_text_document_range_formatting
+        )
+
+    def receive_text_document_range_formatting(
+            self,
+            request: Any,
+            message: JsonObject
+    ) -> None:
+        # NOTE: Implement this in the concrete subclass because it may require
+        # language-specific information (such as the language identifier for the
+        # associated text document).
+        raise NotImplementedError
+
+    def format_range(self, uri: str, selection: Range) -> None:
+        if self.server_supports_range_formatting():
+            params = DocumentRangeFormattingParams(
+                text_document=TextDocumentIdentifier(
+                    uri=uri,
+                ),
+                range=selection,
+                options=FormattingOptions(
+                    tab_size=4,
+                    insert_spaces=True,
+                ),
+            )
+            request_id = self.send_text_document_range_formatting(params)
+            self.await_response(request_id)
